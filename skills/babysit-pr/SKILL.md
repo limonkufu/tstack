@@ -1,9 +1,12 @@
 ---
 name: babysit-pr
-description: Monitor a pull request through review and CI. Use when the user asks to monitor, watch, or babysit a PR.
+description: Monitor a GitLab MR or GitHub PR through review and CI. Use when the user asks to monitor, watch, or babysit an MR or PR.
 ---
 
 # Babysit PR
+
+Use GitLab via `glab` by default. Honor an explicit URL, repository remote,
+or user instruction and use `gh` on GitHub. "PR" below includes GitLab MRs.
 
 Many repos have AI review bots. They're helpful, even if they are not always
 right.
@@ -11,10 +14,14 @@ right.
 ## Waiting
 
 Never write your own watcher, polling loop, or `sleep` loop. Use one watcher
-per PR: `watch_pull_request` in T3 Code, `pr-wait` everywhere else. Never run
-both on the same PR. Every watcher on a GitHub account shares one rate limit.
+per PR: `watch_pull_request` in T3 Code when it supports the selected host,
+`pr-wait` otherwise. Never run both on the same PR. Watchers on the same host
+and account share API limits.
 
 ### In T3 Code: `watch_pull_request`
+
+Check whether the tool supports the selected GitLab or GitHub host. If it
+does not support GitLab, use `pr-wait` below with `glab`.
 
 Handle the existing checks and comments first. Then call
 `watch_pull_request` and end your turn. T3 Code wakes you with a message when
@@ -30,7 +37,7 @@ branch conflicts.
   the user's inbox. When you stop (ready, blocked, or asking the user a question),
   call `unwatch_pull_request` first. A merge or close ends the watch on its
   own.
-- **"Stopped watching, could not read it"** usually means GitHub's rate limit
+- **"Stopped watching, could not read it"** on GitHub usually means its rate limit
   is used up. Run `gh api rate_limit --jq .resources.graphql` before you
   watch again. If `remaining` is near 0, wait for `reset` with one background
   command, then watch again. Never watch again in a tight loop.
@@ -41,17 +48,26 @@ Wait with `scripts/pr-wait` from this skill's directory (use its absolute
 path).
 
 ```bash
-pr-wait <pr> [--repo owner/name] [--until ready|green|any-change]
+pr-wait <iid-or-url> [--repo group/subgroup/project] [--hostname gitlab.example.com] [--until ready|green|any-change]
+pr-wait <pr-or-url> --provider github [--repo owner/name] [--until ready|green|any-change]
 ```
+
+GitLab is the default without host evidence; a GitHub URL or checkout selects
+GitHub automatically. GitLab URLs select their host and nested project path.
+Use `--provider` to override detection. Authentication stays in `glab` or `gh`.
 
 It prints one line per real event. It exits 0 when the `--until` condition is
 met or the PR merges, 1 when it needs you (a required check failed, conflicts,
 unresolved threads, PR closed), and 2 on bad input.
 
 - `ready` (default): required checks green, Greptile or Macroscope reviewed the
-  head, and no unresolved threads. Use this to babysit.
-- `green`: required checks only. Use it when the repo has no Greptile or
-  Macroscope.
+  head, and no unresolved threads. On GitLab this also requires GitLab to
+  report the MR as mergeable, including approvals and draft status.
+- `green`: CI only. On GitLab the current head pipeline must succeed; a missing,
+  stale, skipped, or manual pipeline does not count as green. A merged-results
+  pipeline with a different SHA needs independent verification. Use this mode
+  when the repo has no Greptile or Macroscope, then check the remaining merge
+  gate yourself.
 - `any-change`: exit on the first event.
 
 In Claude Code, run it with the Monitor tool (`timeout_ms: 3600000`), so each
@@ -72,6 +88,12 @@ message. Never post or say "still waiting".
 used up, the REST limit is separate and usually still has room. Use
 `gh api repos/<owner>/<repo>/pulls/<n>` to read a PR, and
 `gh api repos/<owner>/<repo>/commits/<sha>/check-runs` for checks.
+
+On GitLab, `pr-wait` uses paginated REST reads through `glab api`, including
+MR notes and discussions. For manual inspection use `glab mr view <iid>
+--output json` and `glab api projects/:fullpath/merge_requests/<iid>`. Treat
+authentication or API failures as unknown state; do not switch hosts or claim
+that CI passed. Transient failures use bounded backoff.
 
 ## Reviews
 
@@ -101,10 +123,14 @@ narrows code.
 
 ## Base branch and merging
 
-Keep an eye on changes to `main` and rebase when needed. `pr-wait` reports when
-new base commits touch this PR's files, and when the PR becomes BEHIND or DIRTY.
+Keep an eye on changes to the actual target branch and rebase when needed.
+`pr-wait` reports when new base commits touch this PR's files, and when the PR
+becomes BEHIND or DIRTY.
 `watch_pull_request` reports conflicts only, so check for BEHIND yourself
-before you call the PR ready.
+before you call the PR ready. On GitLab, inspect `detailed_merge_status`,
+`has_conflicts`, approvals, unresolved discussions, and the latest head
+pipeline. `need_rebase` means the source branch needs updating; `mergeable`
+alone does not prove the target is an ancestor, so fetch and verify that too.
 If an overlapping PR makes this one obsolete, stop monitoring, report it to the
 user, and ask before closing the PR unless closure was explicitly authorized.
 

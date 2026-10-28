@@ -5,6 +5,9 @@ description: Trigger this if the user says 'full stop', even as a closing "Full 
 
 # Full Stop
 
+Use GitLab MRs via `glab` by default, respecting the host selected by the user
+or repository remote. "PR" below includes GitLab MRs; use `gh` on GitHub.
+
 Do the same work as `full-send`, but stop with the PR ready for the user to merge.
 Never merge it.
 
@@ -26,6 +29,12 @@ Disable existing auto-merge and remove the PR from any merge queue before
 work begins; check again before each push. Report these changes. If you
 cannot prevent automatic merging, report the blocker before proceeding.
 
+On GitLab, inspect the MR with `glab mr view <iid> --output json`, cancel
+scheduled auto-merge through `glab api --method POST
+projects/:fullpath/merge_requests/<iid>/cancel_merge_when_pipeline_succeeds`,
+and remove an existing merge-train entry through the project's `merge_trains`
+API. Only mutate settings that are active; read back the MR and train state.
+
 ## Stop at the gate
 
 Use full-send's merge gate as the readiness check. Replace its merge and
@@ -42,6 +51,7 @@ without the user. If someone else merged it, report that instead.
 - **Blocked:** explain what prevents readiness, what you tried, and what is
   needed. Follow full-send's rules for asking the user.
 
-In T3 Code, call `unwatch_pull_request` before the handoff or a question.
+Cancel any active watcher before the handoff or a question. In T3 Code, call
+`unwatch_pull_request` if a T3 watch was used.
 Report the PR link, final head, verdict, proof, reviewer outcome, and remaining
 risks. State whether the PR is still open and unmerged.

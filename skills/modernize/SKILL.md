@@ -1,11 +1,19 @@
 ---
 name: modernize
 description: >-
-  For getting old prs up to date. Use when asked to rebase a pr or
-  "modernize".
+  For getting old GitLab MRs or GitHub PRs up to date. Use when asked to rebase
+  an MR or PR or "modernize".
 ---
 
 # Modernize
+
+Use GitLab via `glab` by default, or GitHub via `gh` when selected by the
+request or repository remote. "PR" below includes GitLab merge requests.
+For GitLab, use `glab mr view <iid> --output json` and `glab mr checkout <iid>`;
+read discussions, approvals, and pipelines through `glab api
+projects/:fullpath/merge_requests/<iid>/...`. Record `target_branch`,
+`source_branch`, `source_project_id`, and `sha`, including fork source projects.
+Do not assume the target and source branches live in the same remote.
 
 Modernize the idea, not just the branch. A clean rebase does not prove that the
 PR still belongs in the product.

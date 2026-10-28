@@ -1,9 +1,14 @@
 ---
 name: takeover
-description: Take over existing work. Use when the user asks to take over a PR, branch, or agent thread, or requests a takeover.
+description: Take over existing work. Use when the user asks to take over an MR, PR, branch, or agent thread, or requests a takeover.
 ---
 
 # Takeover
+
+Use GitLab via `glab` by default; follow an explicit host or repository remote
+and use `gh` for GitHub. "PR" below includes a GitLab MR. Read GitLab work with
+`glab mr view <iid> --output json` and its discussions, approvals, and pipelines
+through `glab api`; use `glab mr checkout <iid>` for its source branch.
 
 Take responsibility for finishing the original goal while preserving the
 original contributors' credit. Do not defend an implementation just because

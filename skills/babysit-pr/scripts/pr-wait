@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""pr-wait: watch one GitHub pull request and print one line per real event.
+"""pr-wait: watch one GitLab MR or GitHub PR, printing one line per real event.
 
   pr-wait <pr> [--repo owner/name] [--until green|ready|any-change] [--interval 20]
 
-<pr> is a PR number or PR URL. Without --repo, the repo comes from the URL or
+GitLab is the default. A GitHub URL or checkout selects GitHub; --provider
+overrides detection. --hostname selects a self-managed GitLab host.
+<pr> is an MR/PR number or URL. Without --repo, the repo comes from the URL or
 from the current checkout. Stdout carries only events, one line each, so a
 monitor (Claude Code's Monitor tool) wakes the agent once per real event.
 Progress and errors that do not end the run go to stderr.
@@ -19,7 +21,7 @@ Exit codes
   0  the --until condition is met, or the PR merged
   1  the condition cannot be met without action: a required check failed, the
      branch conflicts with its base, the PR closed, `ready` is blocked by
-     unresolved threads or a BEHIND branch, or GitHub stayed unreachable
+     unresolved threads or a BEHIND branch, or the host stayed unreachable
   2  bad arguments, unknown PR, or another pr-wait already watches this PR
 
 Events
@@ -58,6 +60,7 @@ import time
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, NoReturn
+from urllib.parse import quote, urlsplit
 
 GATING_BOTS = ("greptile", "macroscope")
 ADVISORY_BOTS = ("coderabbit",)
@@ -121,18 +124,25 @@ def fail(message: str, code: int = 2) -> NoReturn:
 
 
 def gh(args: list[str], allow: tuple[int, ...] = (0,)) -> subprocess.CompletedProcess[str]:
-    """Run gh. Retries transient failures (HTTP 5xx or 429, network) with backoff."""
+    return cli("gh", args, allow)
+
+
+def cli(command: str, args: list[str], allow: tuple[int, ...] = (0,)) -> subprocess.CompletedProcess[str]:
+    """Use CLI-managed credentials and retry transient failures with backoff."""
     delay = 2
     for attempt in range(5):
-        proc = subprocess.run(["gh", *args], capture_output=True, text=True)
+        try:
+            proc = subprocess.run([command, *args], check=False, capture_output=True, text=True)
+        except FileNotFoundError:
+            raise GhError(f"{command} is not installed", False) from None
         transient = proc.returncode != 0 and bool(TRANSIENT.search(proc.stderr))
         if not transient and proc.returncode in allow:
             return proc
         lines = proc.stderr.strip().splitlines()
-        message = lines[-1] if lines else f"gh exited {proc.returncode}"
+        message = lines[-1] if lines else f"{command} exited {proc.returncode}"
         if not transient or attempt == 4:
             raise GhError(message, transient)
-        log(f"gh {' '.join(args[:2])}: {message}; retry in {delay}s")
+        log(f"{command} {' '.join(args[:2])}: {message}; retry in {delay}s")
         time.sleep(delay)
         delay *= 2
     raise AssertionError("unreachable")
@@ -189,6 +199,11 @@ def parse_target(raw: str | None, repo: str | None) -> tuple[str, int]:
         fail(f"'{raw}' is not a PR number or PR URL")
     if pr <= 0:
         fail(f"'{raw}' is not a valid PR number")
+    location = repository_location(repo or "")
+    if location:
+        if location[0] != "github.com":
+            fail("GitHub --repo must refer to github.com")
+        repo = location[1]
     if not repo:
         try:
             repo = gh(["repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"]).stdout.strip()
@@ -204,10 +219,80 @@ def parse_target(raw: str | None, repo: str | None) -> tuple[str, int]:
     return repo, pr
 
 
+def remote_url() -> str:
+    proc = subprocess.run(["git", "remote", "get-url", "origin"], check=False, capture_output=True, text=True)
+    return proc.stdout.strip() if proc.returncode == 0 else ""
+
+
+def repository_location(raw: str) -> tuple[str, str] | None:
+    """Extract a host and nested project path from HTTPS, SSH, or scp syntax."""
+    scp = re.fullmatch(r"[^/@\s]+@([^/:\s]+):(.+)", raw)
+    if scp:
+        host, path = scp.groups()
+    elif "://" in raw:
+        url = urlsplit(raw)
+        if (url.username or url.password) and (url.scheme != "ssh" or url.password):
+            fail("repository URLs must not contain credentials")
+        host = (url.hostname or "") if url.scheme == "ssh" else url.netloc
+        path = url.path
+    else:
+        return None
+    path = path.strip("/").removesuffix(".git")
+    return (host, path) if host and path else None
+
+
+def provider_for(raw: str | None, repo: str | None, provider: str | None, hostname: str | None) -> str:
+    if provider:
+        return provider
+    if hostname or (raw and "/-/merge_requests/" in raw):
+        return "gitlab"
+    # An explicit --repo wins over the current checkout.
+    location = repository_location(raw) if raw and "://" in raw else None
+    location = location or repository_location(repo or "")
+    if not location and not repo:
+        location = repository_location(remote_url())
+    return "github" if location and location[0] == "github.com" else "gitlab"
+
+
+def parse_gitlab_target(raw: str | None, repo: str | None, hostname: str | None) -> tuple[str, str, int]:
+    value = (raw or "").strip()
+    url = re.fullmatch(r"https?://([^/\s]+)/(.+)/-/merge_requests/(\d+)(?:[/?#]\S*)?", value)
+    number = re.fullmatch(r"!?(\d+)", value)
+    if url:
+        url_host, url_repo, iid = url.groups()
+        repository_location(f"https://{url_host}/{url_repo}")  # reject embedded credentials
+        if hostname and hostname != url_host:
+            fail("--hostname does not match the MR URL")
+        if repo:
+            location = repository_location(repo)
+            if (location and location != (url_host, url_repo)) or (not location and repo != url_repo):
+                fail("--repo does not match the MR URL")
+        hostname, repo = url_host, url_repo
+    elif number:
+        iid = number.group(1)
+        location = repository_location(repo or "")
+        if repo is None:
+            location = repository_location(remote_url())
+        if location:
+            if hostname and hostname != location[0]:
+                fail("--hostname does not match the repository host")
+            hostname, repo = location
+    else:
+        fail("expected a GitLab MR number (!123 or 123) or MR URL")
+    if not repo or not re.fullmatch(r"[\w.-]+(?:/[\w.-]+)+", repo) or int(iid) <= 0:
+        fail("expected a positive MR number and --repo group/project (nested groups are supported)")
+    hostname = hostname or os.environ.get("GITLAB_HOST") or "gitlab.com"
+    if not re.fullmatch(r"[\w.-]+(?::\d+)?", hostname):
+        fail("invalid GitLab hostname")
+    if hostname == "github.com":
+        fail("GitHub repositories require --provider github")
+    return hostname, repo, int(iid)
+
+
 def lock(repo: str, pr: int) -> Any:
     """Hold a per-PR lock for the life of the process. The OS drops it on exit."""
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    handle = open(STATE_DIR / f"{repo.replace('/', '__')}__{pr}.lock", "a+")
+    handle = open(STATE_DIR / f"{repo.replace('/', '__')}__{pr}.lock", "a+")  # noqa: SIM115 -- held for the process lifetime
     try:
         fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
@@ -246,10 +331,13 @@ def required_checks(repo: str, base: str) -> set[str]:
 
 
 class Watcher:
-    def __init__(self, repo: str, pr: int, until: str, interval: int) -> None:
+    marker = "#"
+    host_label = "GitHub"
+
+    def __init__(self, repo: str, pr: int, until: str, interval: int, state_key: str | None = None) -> None:
         self.repo, self.pr, self.until, self.interval = repo, pr, until, interval
-        self.owner, self.name = repo.split("/")
-        self.path = STATE_DIR / f"{repo.replace('/', '__')}__{pr}.json"
+        self.owner, self.name = repo.split("/", 1)
+        self.path = STATE_DIR / f"{(state_key or repo).replace('/', '__')}__{pr}.json"
         state = self.load()
         # First run for this PR: record what exists and report nothing.
         self.baseline = state is None
@@ -278,7 +366,7 @@ class Watcher:
     def say(self, line: str) -> None:
         if line not in self.printed:
             self.printed.add(line)
-            print(f"#{self.pr} {line}", flush=True)
+            print(f"{self.marker}{self.pr} {line}", flush=True)
 
     def emit(self, key: str, line: str) -> None:
         """Print an event once per PR, across restarts."""
@@ -304,6 +392,9 @@ class Watcher:
         pr = data["repository"]["pullRequest"]
         pr["viewer"] = data["viewer"]["login"]
         return pr
+
+    def required_checks(self, base: str) -> set[str]:
+        return required_checks(self.repo, base)
 
     def fetch_checks(self) -> dict[str, Json]:
         # gh pr checks exits 8 while checks are pending and 1 when one failed.
@@ -350,7 +441,7 @@ class Watcher:
 
         base = pr["baseRefName"]
         if self.required is None:
-            self.required = required_checks(self.repo, base)
+            self.required = self.required_checks(base)
             gate = ", ".join(sorted(self.required)) or "none set, so every CI check gates"
             log(f"watching {self.repo}#{self.pr} until {self.until}; required checks: {gate}")
         checks = self.fetch_checks()
@@ -504,6 +595,8 @@ class Watcher:
                 self.reported.add(checks_key)
                 self.finish(0, [f"green on {short}: {summary}{self.behind(base, base_oid, head)}"])
             # ready waits for Greptile or Macroscope, never for CodeRabbit.
+            if green and self.until == "ready" and pr.get("readinessBlocker"):
+                self.finish(1, [pr["readinessBlocker"]])
             if green and reviewed:
                 if unresolved:
                     self.finish(1, [f"blocked by {len(unresolved)} unresolved threads on {short}: {' '.join(unresolved)}"])
@@ -528,7 +621,7 @@ class Watcher:
                 failures += 1
                 log(f"poll failed ({failures}/{MAX_FAILED_POLLS}): {error}")
                 if failures >= MAX_FAILED_POLLS:
-                    self.finish(1, [f"pr-wait stopped: GitHub unreachable for {failures} polls: {error}"])
+                    self.finish(1, [f"pr-wait stopped: {self.host_label} unreachable for {failures} polls: {error}"])
             else:
                 self.save()
                 if self.baseline:
@@ -537,16 +630,130 @@ class Watcher:
             time.sleep(self.interval)
 
 
+class GitLabWatcher(Watcher):
+    marker = "!"
+    host_label = "GitLab"
+
+    def __init__(self, host: str, repo: str, pr: int, until: str, interval: int) -> None:
+        super().__init__(repo, pr, until, interval, f"gitlab/{host}/{repo}")
+        self.host = host
+        self.project = f"projects/{quote(repo, safe='')}"
+        self.endpoint = f"{self.project}/merge_requests/{pr}"
+        self.viewer: str | None = None
+        self.pipeline: Json = {}
+        self.head = ""
+
+    def api(self, path: str, paginate: bool = False) -> Any:
+        args = ["api", "--hostname", self.host, path]
+        if paginate:
+            args.append("--paginate")
+        output = cli("glab", args).stdout.strip()
+        if not paginate:
+            return json.loads(output)
+        # glab versions emit either one combined array or consecutive page arrays.
+        rows: list[Json] = []
+        decoder = json.JSONDecoder()
+        while output:
+            page, end = decoder.raw_decode(output)
+            rows.extend(page)
+            output = output[end:].lstrip()
+        return rows
+
+    def required_checks(self, base: str) -> set[str]:
+        return {"GitLab pipeline"}
+
+    def fetch_pr(self) -> Json:
+        mr = self.api(f"{self.endpoint}?with_merge_status_recheck=true")
+        state = {"merged": "MERGED", "closed": "CLOSED"}.get(mr["state"], "OPEN")
+        if state != "OPEN":
+            return {"state": state, "url": mr["web_url"]}
+        if self.viewer is None:
+            self.viewer = self.api("user")["username"]
+        self.pipeline = mr.get("head_pipeline") or {}
+        self.head = mr["sha"]
+
+        def note(node: Json) -> Json:
+            author = node.get("author") or {}
+            return {
+                "id": str(node["id"]), "body": node["body"],
+                "url": f"{mr['web_url']}#note_{node['id']}",
+                "author": {"login": author.get("username"), "__typename": "Bot" if author.get("bot") else "User"},
+            }
+
+        comments = [note(n) for n in self.api(f"{self.endpoint}/notes?per_page=100", True) if not n.get("system")]
+        threads = []
+        for discussion in self.api(f"{self.endpoint}/discussions?per_page=100", True):
+            nodes = [n for n in discussion["notes"] if not n.get("system")]
+            if not nodes or discussion.get("individual_note"):
+                continue
+            position = nodes[0].get("position") or {}
+            threads.append({
+                "isResolved": all(not n.get("resolvable") or n.get("resolved") for n in nodes),
+                "path": position.get("new_path") or position.get("old_path") or "discussion",
+                "line": position.get("new_line") or position.get("old_line"),
+                "comments": {"nodes": [note(n) for n in nodes]},
+            })
+        base = self.api(f"{self.project}/repository/branches/{quote(mr['target_branch'], safe='')}")
+        status = mr.get("detailed_merge_status") or mr.get("merge_status") or "unknown"
+        merge_state = "BLOCKED"
+        if mr.get("has_conflicts") or status == "conflict":
+            merge_state = "DIRTY"
+        elif status == "need_rebase":
+            merge_state = "BEHIND"
+        elif status == "mergeable" and not mr.get("draft") and not mr.get("work_in_progress"):
+            merge_state = "CLEAN"
+        return {
+            "state": state, "url": mr["web_url"], "headRefOid": self.head,
+            "baseRefName": mr["target_branch"], "baseRef": {"target": {"oid": base["commit"]["id"]}},
+            "author": {"login": mr["author"]["username"]}, "viewer": self.viewer,
+            "mergeStateStatus": merge_state, "comments": {"nodes": comments},
+            "reviews": {"nodes": []}, "reviewThreads": {"nodes": threads},
+            "readinessBlocker": f"GitLab merge gate blocked: {status} (draft: {bool(mr.get('draft') or mr.get('work_in_progress'))})"
+            if merge_state == "BLOCKED" else None,
+        }
+
+    def fetch_checks(self) -> dict[str, Json]:
+        pipeline = self.pipeline
+        status = pipeline.get("status", "missing")
+        bucket = {"success": "pass", "failed": "fail", "canceled": "cancel"}.get(status, "pending")
+        if pipeline.get("sha") != self.head:
+            bucket = "pending"
+            status = "missing or different-head pipeline; verify merged-results pipelines independently"
+        return {"GitLab pipeline": {
+            "name": "GitLab pipeline", "bucket": bucket,
+            "link": pipeline.get("web_url", ""), "description": status,
+        }}
+
+    def base_overlap(self, head: str, old: str, new: str) -> list[str]:
+        if head not in self.pr_files:
+            changes = self.api(f"{self.endpoint}/diffs?per_page=100", True)
+            self.pr_files[head] = {path for row in changes for path in (row["old_path"], row["new_path"])}
+        moved = self.api(f"{self.project}/repository/compare?from={quote(old, safe='')}&to={quote(new, safe='')}&straight=true")
+        paths = {path for row in moved["diffs"] for path in (row["old_path"], row["new_path"])}
+        return sorted(self.pr_files[head].intersection(paths))
+
+    def behind(self, base: str, base_oid: str | None, head: str) -> str:
+        return ""  # need_rebase is reported through detailed_merge_status.
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(prog="pr-wait", description="Watch a GitHub PR and print one line per real event.")
-    parser.add_argument("pr", nargs="?", help="PR number or URL")
-    parser.add_argument("--repo", help="owner/name (default: from the URL or the current checkout)")
+    parser = argparse.ArgumentParser(prog="pr-wait", description="Watch a GitLab MR (default) or GitHub PR and print one line per real event.")
+    parser.add_argument("pr", nargs="?", help="MR/PR number or URL")
+    parser.add_argument("--repo", help="group/subgroup/project or repository URL (default: from the review URL or checkout)")
+    parser.add_argument("--provider", choices=("gitlab", "github"), help="override host detection (default: GitLab)")
+    parser.add_argument("--hostname", help="GitLab host (default: from URL, checkout, GITLAB_HOST, or gitlab.com)")
     parser.add_argument("--until", choices=("green", "ready", "any-change"), default="ready")
     parser.add_argument("--interval", type=int, default=20, help="seconds between polls (default 20, min 5)")
     args = parser.parse_args()
-    repo, pr = parse_target(args.pr, args.repo)
-    _lock = lock(repo, pr)
-    Watcher(repo, pr, args.until, max(args.interval, 5)).run()
+    provider = provider_for(args.pr, args.repo, args.provider, args.hostname)
+    if provider == "gitlab":
+        host, repo, pr = parse_gitlab_target(args.pr, args.repo, args.hostname)
+        _lock = lock(f"gitlab/{host}/{repo}", pr)
+        GitLabWatcher(host, repo, pr, args.until, max(args.interval, 5)).run()
+    else:
+        repo, pr = parse_target(args.pr, args.repo)
+        _lock = lock(repo, pr)
+        Watcher(repo, pr, args.until, max(args.interval, 5)).run()
 
 
 if __name__ == "__main__":

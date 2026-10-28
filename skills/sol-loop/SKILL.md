@@ -5,6 +5,9 @@ description: Use when the user says "sol loop".
 
 # sol-loop
 
+Use GitLab MRs via `glab` by default; honor an explicit host or repository
+remote and use `gh` on GitHub. "PR" below includes GitLab merge requests.
+
 This is a workflow for making your code changes more correct before (or
 sometimes after) filing a pull request. tl;dr - use OpenAI's GPT Sol to review
 your code in a loop.
@@ -32,7 +35,11 @@ Otherwise stop and ask.
 
 Find the base after `git fetch origin`:
 
-- PR: `gh pr view <n> --json baseRefName,headRefOid`. Check out the branch
+- GitLab MR: `glab mr view <iid> --output json`. Read `target_branch`,
+  `source_branch`, `source_project_id`, and `sha`. Use `glab mr checkout <iid>`
+  only if clean. Confirm `HEAD` matches that SHA or is ahead only by this
+  change. Base: `git merge-base HEAD <target-remote>/<target_branch>`.
+- GitHub PR: `gh pr view <n> --json baseRefName,headRefOid`. Check out the branch
   only if clean. Confirm `HEAD` is the PR head, or ahead only by this
   change. Base: `git merge-base HEAD origin/<baseRefName>`.
 - Local: `git merge-base HEAD origin/<default-branch>`. No remote: a base
@@ -108,8 +115,9 @@ or budget ends. Show both sides in 2-3 lines each. The user decides.
 Budget end is not approval.
 
 Do not push during the loop. Push after agreement only if the user asked
-to push, ship, or update the PR. If you push to a PR, add above the model
-blurb:
+to push, ship, or update the PR. If you push to an MR or PR, update its
+description with `glab mr update --description-file` or `gh pr edit --body-file`.
+Add above the model blurb:
 
 `Reviewed with sol-loop: <N> rounds with <model>. Sol verdict: approved`.
 

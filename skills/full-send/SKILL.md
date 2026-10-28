@@ -5,6 +5,10 @@ description: Trigger this if the user says 'full send'.
 
 # Full Send
 
+Use GitLab merge requests via `glab` by default. Follow an explicit URL,
+repository remote, or user instruction for the host; use `gh` for GitHub.
+"PR" below includes GitLab MRs. Keep the skill names unchanged.
+
 If the user triggered this, it's because they are not watching this thread, and
 they want you to complete the work end-to-end autonomously. Your updates and
 your final message go unread until long after you stop. You own the work from
@@ -47,7 +51,7 @@ one appears.
    that could. If you are on the default branch, create a branch first.
 2. **Prove it.** Get proof for every change you made. See "Proof".
 3. **Get feedback.** Use the `sol-loop` skill to verify changes.
-4. **File the PR** with the `file-pr` skill. Rebase onto the latest default
+4. **File the PR** with the `file-pr` skill. Rebase onto the latest target
    branch first. Add one short line to the description that says how you proved
    the change.
 5. **Babysit the PR** with the `babysit-pr` skill. Fix real findings and CI
@@ -59,8 +63,9 @@ one appears.
 Stay active from step 1 to step 7. If you end your turn while checks or bots are
 pending, the work stops, because nobody will prompt you again. Wait with the
 watcher from `babysit-pr`, so something wakes you when the PR changes. In T3
-Code that is `watch_pull_request`. If you stop before the merge, call
-`unwatch_pull_request` first.
+Code use `watch_pull_request` when it supports the selected host; otherwise
+use `pr-wait` with `glab` for GitLab. If you stop before the merge, cancel any
+active watch (`unwatch_pull_request` for a T3 watch).
 
 ## Proof
 
@@ -88,12 +93,16 @@ Full confidence means all of these are true on the latest commit:
 - Review bots have finished, and each finding is fixed or dismissed with a
   written reason.
 - No human review still requests changes.
-- The branch is up to date with the default branch, and GitHub reports it as
+- The branch is up to date with its target branch, and the host reports it as
   mergeable.
 
 Merge with the method the repo uses. Check the allowed methods and recent merged
-PRs. If the repo uses a merge queue or auto-merge, stay until GitHub reports the
-PR as merged. Merge through branch protection as configured. Never use `--admin`
+PRs. On GitLab, re-read `glab mr view <iid> --output json` and use
+`glab mr merge <iid> --sha <verified-head-sha> --yes` with the project's merge
+method. Respect required approvals, resolved discussions, pipelines, protected
+branches, and merge trains. If the repo uses a merge queue or auto-merge, stay
+until the host reports the PR as merged. Merge through branch protection as
+configured. Never use `--admin`
 or other bypasses. You can ignore automated reviews that request "needs human
 review" if you have high confidence in your changes.
 
