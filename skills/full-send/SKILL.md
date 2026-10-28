@@ -90,8 +90,8 @@ Full confidence means all of these are true on the latest commit:
 
 - Your proof covers every change in the diff.
 - Required checks are green.
-- Review bots have finished, and each finding is fixed or dismissed with a
-  written reason.
+- Review bots used for this change have finished, and each finding is fixed or
+  dismissed with a written reason.
 - No human review still requests changes.
 - The branch is up to date with its target branch, and the host reports it as
   mergeable.

@@ -60,14 +60,14 @@ It prints one line per real event. It exits 0 when the `--until` condition is
 met or the PR merges, 1 when it needs you (a required check failed, conflicts,
 unresolved threads, PR closed), and 2 on bad input.
 
-- `ready` (default): required checks green, Greptile or Macroscope reviewed the
-  head, and no unresolved threads. On GitLab this also requires GitLab to
-  report the MR as mergeable, including approvals and draft status.
+- `ready` (default): required checks green, any reported current-head Greptile
+  or Macroscope checks finished, and no unresolved threads. Neither bot is
+  required when absent. GitLab must report the MR as mergeable; GitHub must
+  have no pending required approval, changes-requested verdict, or draft status.
 - `green`: CI only. On GitLab the current head pipeline must succeed; a missing,
   stale, skipped, or manual pipeline does not count as green. A merged-results
   pipeline with a different SHA needs independent verification. Use this mode
-  when the repo has no Greptile or Macroscope, then check the remaining merge
-  gate yourself.
+  for CI-only waiting, then check the remaining merge gate yourself.
 - `any-change`: exit on the first event.
 
 In Claude Code, run it with the Monitor tool (`timeout_ms: 3600000`), so each
@@ -96,6 +96,11 @@ authentication or API failures as unknown state; do not switch hosts or claim
 that CI passed. Transient failures use bounded backoff.
 
 ## Reviews
+
+Follow the repository's actual review requirements. Do not wait for Greptile
+or Macroscope on a repository that does not use them. Handle comment-only bot
+reviews separately when the repository or user requires them; old or unversioned
+notes are not a current-head completion signal.
 
 Only act on checks and comments newer than the latest push. Verify every bot
 finding against the source before changing code. Fix real findings and CI

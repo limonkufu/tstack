@@ -13,8 +13,8 @@ Progress and errors that do not end the run go to stderr.
 --until
   green       required checks passed on the current head (every CI check when
               the base branch requires none)
-  ready      green, Greptile or Macroscope reviewed the current head, and no
-              review thread is unresolved (default)
+  ready       green, reported review-bot checks finished, host review rules
+              satisfied, and no unresolved review threads (default)
   any-change  stop after the first poll that prints an event
 
 Exit codes
@@ -86,7 +86,7 @@ query($owner: String!, $name: String!, $number: Int!) {
   viewer { login }
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
-      url state headRefOid baseRefName mergeStateStatus
+      url state headRefOid baseRefName mergeStateStatus isDraft reviewDecision
       author { login }
       baseRef { target { oid } }
       comments(last: 100) { nodes { id url body author { login __typename } } }
@@ -391,6 +391,9 @@ class Watcher:
         data = json.loads(proc.stdout)["data"]
         pr = data["repository"]["pullRequest"]
         pr["viewer"] = data["viewer"]["login"]
+        if pr.get("isDraft") or pr.get("reviewDecision") in ("REVIEW_REQUIRED", "CHANGES_REQUESTED"):
+            reason = "draft" if pr.get("isDraft") else pr["reviewDecision"]
+            pr["readinessBlocker"] = f"GitHub merge gate blocked: {reason}"
         return pr
 
     def required_checks(self, base: str) -> set[str]:
@@ -507,7 +510,7 @@ class Watcher:
         # finish. Otherwise it is done once it reviews the head commit or its
         # summary names the head.
         bot_status: dict[str, str] = {}
-        reviewed: list[str] = []
+        pending_review_bots: list[str] = []
         for bot in GATING_BOTS + ADVISORY_BOTS:
             own_checks = {name: c for name, c in checks.items() if bot_name(name) == bot}
             summaries = [c for c in comments if bot_name(who(c)[0]) == bot]
@@ -517,17 +520,18 @@ class Watcher:
                 done = all(c["bucket"] != "pending" for c in own_checks.values())
             else:
                 done = on_head or any(short in s["body"] for s in summaries)
+            if bot in GATING_BOTS and own_checks and not done:
+                pending_review_bots.append(bot)
             seen = bool(own_checks or summaries or own_reviews)
             if bot in ADVISORY_BOTS and own_checks:
                 desc = next(iter(own_checks.values()))
                 bot_status[bot] = f"{bot} {desc['description'] or desc['bucket']} (advisory)"
             elif seen:
-                bot_status[bot] = f"{bot} {'done' if done else 'pending'}{' (advisory)' if bot in ADVISORY_BOTS else ''}"
+                status = "done" if done else ("pending" if own_checks else "notes only")
+                bot_status[bot] = f"{bot} {status}{' (advisory)' if bot in ADVISORY_BOTS else ''}"
             key = f"bot:{bot}:{head}"
             was_done = key in self.reported
             if done:
-                if bot in GATING_BOTS:
-                    reviewed.append(bot)
                 failed = [name for name, c in own_checks.items() if c["bucket"] in FAILED]
                 detail = "; ".join(filter(None, [
                     next((v for v in map(verdict, (s["body"] for s in summaries)) if v), ""),
@@ -577,7 +581,7 @@ class Watcher:
             if self.required
             else "",
             ", ".join(bot_status[b] for b in GATING_BOTS + ADVISORY_BOTS if b in bot_status)
-            or "no Greptile or Macroscope yet",
+            or "no review-bot checks reported",
             f"{len(unresolved)} unresolved threads",
             f"merge state {merge_state}",
         ]
@@ -594,10 +598,10 @@ class Watcher:
             if green and self.until == "green":
                 self.reported.add(checks_key)
                 self.finish(0, [f"green on {short}: {summary}{self.behind(base, base_oid, head)}"])
-            # ready waits for Greptile or Macroscope, never for CodeRabbit.
+            # Wait for reported bot checks, without requiring an absent vendor.
             if green and self.until == "ready" and pr.get("readinessBlocker"):
                 self.finish(1, [pr["readinessBlocker"]])
-            if green and reviewed:
+            if green and not pending_review_bots:
                 if unresolved:
                     self.finish(1, [f"blocked by {len(unresolved)} unresolved threads on {short}: {' '.join(unresolved)}"])
                 if merge_state == "BEHIND":

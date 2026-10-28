@@ -89,6 +89,21 @@ class GitLabTests(unittest.TestCase):
         watcher.poll()
         self.assert_exit(watcher, 0, "!42 green on aaaaaaa")
 
+    def test_ready_does_not_require_a_review_bot(self):
+        watcher = self.watcher("ready")
+        watcher.poll()
+        self.assert_exit(watcher, 0, "!42 ready on aaaaaaa")
+
+    def test_old_or_unversioned_bot_notes_do_not_hold_ready_mr(self):
+        for body in ("Reviewed an older commit", "Review in progress"):
+            with self.subTest(body=body):
+                self.notes = [
+                    {"id": 1, "body": body, "author": {"username": "greptile"}}
+                ]
+                watcher = self.watcher("ready")
+                watcher.poll()
+                self.assert_exit(watcher, 0, "!42 ready on aaaaaaa")
+
     def test_missing_stale_skipped_and_manual_pipelines_never_pass(self):
         for pipeline in (
             None,
@@ -111,26 +126,64 @@ class GitLabTests(unittest.TestCase):
                     self.watcher(), 1, "required check failed: GitLab pipeline"
                 )
 
-    def test_ready_requires_current_review(self):
+    def test_ready_waits_for_each_reported_review_bot_check(self):
         watcher = self.watcher("ready")
+        checks = {"GitLab pipeline": {"bucket": "pass", "link": ""}}
+        for name in ("Greptile", "Macroscope"):
+            checks[name] = {"bucket": "pending", "link": ""}
+        watcher.fetch_checks = Mock(return_value=checks)
         watcher.poll()
-        self.notes.append(
-            {
-                "id": 1,
-                "body": "Reviewed an older commit",
-                "author": {"username": "greptile"},
+        watcher.poll()
+        checks["Greptile"]["bucket"] = "pass"
+        watcher.poll()
+        watcher.poll()
+        checks["Macroscope"]["bucket"] = "pass"
+        watcher.poll()
+        self.assert_exit(watcher, 0, "!42 ready on aaaaaaa")
+
+    def test_missing_required_bot_check_still_blocks_ready(self):
+        watcher = self.watcher("ready")
+        watcher.required_checks = Mock(return_value={"GitLab pipeline", "Greptile"})
+        watcher.poll()
+        watcher.poll()
+        self.assertNotIn("ready on", self.output.getvalue())
+
+    def test_failed_required_bot_check_needs_action(self):
+        watcher = self.watcher("ready")
+        watcher.required_checks = Mock(return_value={"GitLab pipeline", "Greptile"})
+        watcher.fetch_checks = Mock(
+            return_value={
+                "GitLab pipeline": {"bucket": "pass", "link": ""},
+                "Greptile": {"bucket": "fail", "link": "review-check"},
             }
         )
+        self.assert_exit(watcher, 1, "required check failed: Greptile")
+
+    def test_coderabbit_remains_advisory(self):
+        watcher = self.watcher("ready")
+        checks = {"GitLab pipeline": {"bucket": "pass", "link": ""}}
+        checks["CodeRabbit"] = {
+            "bucket": "pending",
+            "link": "",
+            "description": "Review pending",
+        }
+        watcher.fetch_checks = Mock(return_value=checks)
         watcher.poll()
-        self.add_review()
         self.assert_exit(watcher, 0, "!42 ready on aaaaaaa")
+
+    def test_green_mode_does_not_wait_for_optional_bot_checks(self):
+        watcher = self.watcher("green")
+        checks = {"GitLab pipeline": {"bucket": "pass", "link": ""}}
+        checks["Greptile"] = {"bucket": "pending", "link": ""}
+        watcher.fetch_checks = Mock(return_value=checks)
+        watcher.poll()
+        self.assert_exit(watcher, 0, "!42 green on aaaaaaa")
 
     def test_approval_and_draft_blocks_are_not_ready(self):
         for changes in ({"detailed_merge_status": "not_approved"}, {"draft": True}):
             with self.subTest(changes=changes):
                 original = copy.deepcopy(self.mr)
                 self.mr.update(changes)
-                self.add_review()
                 watcher = self.watcher("ready")
                 watcher.poll()
                 self.assert_exit(watcher, 1, "GitLab merge gate blocked")
@@ -147,7 +200,6 @@ class GitLabTests(unittest.TestCase):
         self.assert_exit(watcher, 1, "merge state is BEHIND")
 
     def test_unresolved_discussion_blocks_ready(self):
-        self.add_review()
         self.discussions = [
             {
                 "notes": [
@@ -225,8 +277,6 @@ class GitLabTests(unittest.TestCase):
         )
 
     def test_main_watches_gitlab_through_glab(self):
-        self.add_review()
-
         def command(args, **kwargs):
             self.assertEqual(
                 args[:4], ["glab", "api", "--hostname", "gitlab.example.com"]
@@ -253,28 +303,56 @@ class GitLabTests(unittest.TestCase):
         self.assertIn("pr-wait stopped: 401 Unauthorized", self.output.getvalue())
         self.assertNotIn("green on", self.output.getvalue())
 
-    def test_github_green_behavior_is_preserved(self):
-        watcher = pr_wait.Watcher("owner/repo", 42, "green", 5)
-        watcher.fetch_pr = Mock(
-            return_value={
-                "state": "OPEN",
-                "url": "https://github.com/owner/repo/pull/42",
-                "baseRefName": "main",
-                "headRefOid": "a" * 40,
-                "author": {"login": "author"},
-                "viewer": "agent",
-                "comments": {"nodes": []},
-                "reviews": {"nodes": []},
-                "reviewThreads": {"nodes": []},
-                "mergeStateStatus": "CLEAN",
-            }
+    def github_watcher(self, until="green", **fields):
+        watcher = pr_wait.Watcher("owner/repo", 42, until, 5)
+        pr = {
+            "state": "OPEN",
+            "url": "https://github.com/owner/repo/pull/42",
+            "baseRefName": "main",
+            "headRefOid": "a" * 40,
+            "author": {"login": "author"},
+            "comments": {"nodes": []},
+            "reviews": {"nodes": []},
+            "reviewThreads": {"nodes": []},
+            "mergeStateStatus": "CLEAN",
+            "isDraft": False,
+            "reviewDecision": None,
+        }
+        pr.update(fields)
+        response = {
+            "data": {"viewer": {"login": "agent"}, "repository": {"pullRequest": pr}}
+        }
+        command = patch.object(
+            pr_wait, "gh", return_value=Mock(stdout=json.dumps(response))
         )
+        command.start()
+        self.addCleanup(command.stop)
         watcher.required_checks = Mock(return_value={"test"})
         watcher.fetch_checks = Mock(
             return_value={"test": {"bucket": "pass", "link": ""}}
         )
+        return watcher
+
+    def test_github_green_behavior_is_preserved(self):
+        watcher = self.github_watcher()
         watcher.poll()
         self.assert_exit(watcher, 0, "#42 green on aaaaaaa")
+
+    def test_github_ready_does_not_require_a_review_bot(self):
+        watcher = self.github_watcher("ready")
+        watcher.poll()
+        self.assert_exit(watcher, 0, "#42 ready on aaaaaaa")
+
+    def test_github_ready_preserves_approval_and_draft_requirements(self):
+        for fields, reason in (
+            ({"isDraft": True}, "draft"),
+            ({"reviewDecision": "REVIEW_REQUIRED"}, "REVIEW_REQUIRED"),
+            ({"reviewDecision": "CHANGES_REQUESTED"}, "CHANGES_REQUESTED"),
+        ):
+            with self.subTest(fields=fields):
+                watcher = self.github_watcher("ready", **fields)
+                watcher.poll()
+                self.assert_exit(watcher, 1, f"GitHub merge gate blocked: {reason}")
 
 
 class TargetTests(unittest.TestCase):
